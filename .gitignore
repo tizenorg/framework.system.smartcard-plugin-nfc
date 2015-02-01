@@ -1,0 +1,11 @@
+.cproject
+.project
+obj-arm-linux-gnueabi
+tmp
+debian/smartcard-plugin-nfc
+debian/smartcard-plugin-nfc-dbg
+debian/*.debhelper
+debian/*.substvars
+debian/files
+debian/smartcard-plugin-nfc.substvars
+gbs_temp
