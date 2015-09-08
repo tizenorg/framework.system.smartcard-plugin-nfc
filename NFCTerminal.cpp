@@ -1,31 +1,32 @@
 /*
-* Copyright (c) 2012 Samsung Electronics Co., Ltd All Rights Reserved
-*
-* Licensed under the Apache License, Version 2.0 (the "License");
-* you may not use this file except in compliance with the License.
-* You may obtain a copy of the License at
-*
-* http://www.apache.org/licenses/LICENSE-2.0
-*
-* Unless required by applicable law or agreed to in writing, software
-* distributed under the License is distributed on an "AS IS" BASIS,
-* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-* See the License for the specific language governing permissions and
-* limitations under the License.
-*/
-
+ * Copyright (c) 2012, 2013 Samsung Electronics Co., Ltd.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
 
 /* standard library header */
-#include <stdio.h>
+#include <cstdio>
+#include <cstring>
 #include <unistd.h>
-#include <string.h>
 #include <sys/time.h>
+#include <glib.h>
 
 /* SLP library header */
-#include "net_nfc.h"
-#include "net_nfc_internal_se.h"
+#include "nfc.h"
+#include "nfc_internal.h"
 
 /* local header */
+#include "smartcard-types.h"
 #include "Debug.h"
 #include "TerminalInterface.h"
 #include "NFCTerminal.h"
@@ -33,6 +34,8 @@
 #ifndef EXPORT_API
 #define EXPORT_API __attribute__((visibility("default")))
 #endif
+
+#define ASYNC
 
 using namespace smartcard_service_api;
 
@@ -47,42 +50,43 @@ void __attribute__ ((destructor)) lib_fini()
 {
 }
 
-/* below trhee functions must be implemented */
-extern "C" EXPORT_API const char *get_name()
+/* below three functions must be implemented */
+extern "C"
+{
+EXPORT_API const char *get_name()
 {
 	return se_name;
 }
 
-extern "C" EXPORT_API void *create_instance()
+EXPORT_API void *create_instance()
 {
 	return (void *)NFCTerminal::getInstance();
 }
 
-extern "C" EXPORT_API void destroy_instance(void *instance)
+EXPORT_API void destroy_instance(void *instance)
 {
 	NFCTerminal *inst = (NFCTerminal *)instance;
+
 	if (inst == NFCTerminal::getInstance())
 	{
 		inst->finalize();
 	}
 	else
 	{
-		SCARD_DEBUG_ERR("instance is invalid : getInstance [%p], instance [%p]", NFCTerminal::getInstance(), instance);
+		_ERR("instance is invalid : getInstance [%p], instance [%p]",
+			NFCTerminal::getInstance(), instance);
 	}
+}
 }
 
 namespace smartcard_service_api
 {
-	NFCTerminal::NFCTerminal():Terminal()
+	NFCTerminal::NFCTerminal() : Terminal(), seHandle(NULL),
+		present(false), referred(0)
 	{
-		seHandle = NULL;
-		closed = true;
 		name = (char *)se_name;
 
-		if (initialize())
-		{
-			open();
-		}
+		initialize();
 	}
 
 	NFCTerminal *NFCTerminal::getInstance()
@@ -99,29 +103,24 @@ namespace smartcard_service_api
 
 	bool NFCTerminal::initialize()
 	{
-		int ret = 0;
+		int ret;
 
-		if (initialized == false)
+		if (initialized == true)
+			return initialized;
+
+		ret = nfc_manager_initialize();
+		if (ret == NFC_ERROR_NONE)
 		{
-			if ((ret = net_nfc_initialize()) == NET_NFC_OK)
-			{
-				net_nfc_state_activate(1);
+			initialized = true;
 
-				if ((ret = net_nfc_set_response_callback(&NFCTerminal::nfcResponseCallback, this)) == NET_NFC_OK)
-				{
-					SCARD_DEBUG("nfc initialize success");
-
-					initialized = true;
-				}
-				else
-				{
-					SCARD_DEBUG_ERR("net_nfc_set_response_callback failed [%d]", ret);
-				}
+			if (open() == true) {
+				present = true;
+				close();
 			}
-			else
-			{
-				SCARD_DEBUG_ERR("net_nfc_initialize failed [%d]", ret);
-			}
+		}
+		else
+		{
+			_ERR("net_nfc_initialize failed [%d]", ret);
 		}
 
 		return initialized;
@@ -129,293 +128,159 @@ namespace smartcard_service_api
 
 	void NFCTerminal::finalize()
 	{
-		net_nfc_error_e ret;
+		int ret;
 
-		if (seHandle != NULL)
-		{
-			net_nfc_close_internal_secure_element(seHandle, this);
+		if (isClosed() == false) {
+			/* close now */
+			ret = nfc_se_close_secure_element_internal(seHandle);
+			if (ret == NFC_ERROR_NONE) {
+				seHandle = NULL;
+				closed = true;
+				referred = 0;
+			} else {
+				_ERR("nfc_se_close_secure_element failed [%d]", ret);
+			}
 		}
 
-		net_nfc_deinitialize();
+		ret = nfc_manager_deinitialize();
+		if (ret == NFC_ERROR_NONE) {
+			initialized = false;
+		} else {
+			_ERR("nfc_manager_deinitialize failed [%d]", ret);
+		}
 	}
 
 	bool NFCTerminal::open()
 	{
-		bool result = false;
-		net_nfc_error_e ret;
-		int rv;
+		int ret;
 
-		SCARD_BEGIN();
+		_BEGIN();
 
-		if (isClosed() == true)
-		{
-			if ((ret = net_nfc_open_internal_secure_element(NET_NFC_SE_TYPE_ESE, this)) == NET_NFC_OK)
-			{
-#ifndef ASYNC
-				syncLock();
-				if ((rv = waitTimedCondition(3)) == 0 && error == NET_NFC_OK)
-				{
-#endif
-					result = true;
-					SCARD_DEBUG("net_nfc_open_internal_secure_element returns [%d]", ret);
-#ifndef ASYNC
+		if (isInitialized()) {
+			if (referred == 0) {
+				ret = nfc_se_open_secure_element_internal(NFC_SE_TYPE_ESE,
+					&seHandle);
+				if (ret == NFC_ERROR_NONE) {
+					closed = false;
+					referred++;
+				} else {
+					_ERR("nfc_se_open_secure_element failed [%d]", ret);
 				}
-				else
-				{
-					SCARD_DEBUG_ERR("net_nfc_open_internal_secure_element failed cbResult [%d], rv [%d]", error, rv);
-				}
-				syncUnlock();
-#endif
+			} else {
+				referred++;
 			}
-			else
-			{
-				SCARD_DEBUG_ERR("net_nfc_set_secure_element_type failed [%d]", ret);
-			}
+
+			_DBG("reference count [%d]", referred);
 		}
 
-		SCARD_END();
+		_END();
 
-		return result;
+		return (isClosed() == false);
 	}
 
 	void NFCTerminal::close()
 	{
-		net_nfc_error_e ret;
-		int rv;
+		int ret;
 
-		SCARD_BEGIN();
+		_BEGIN();
 
-		if (isInitialized() && isClosed() == false && seHandle != NULL)
+		if (isInitialized())
 		{
-			if ((ret = net_nfc_close_internal_secure_element(seHandle, this)) == NET_NFC_OK)
+			if (referred <= 1) {
+				ret = nfc_se_close_secure_element_internal(seHandle);
+				if (ret == NFC_ERROR_NONE) {
+					seHandle = NULL;
+					closed = true;
+					referred = 0;
+				} else {
+					_ERR("nfc_se_close_secure_element failed [%d]", ret);
+				}
+			} else {
+				referred--;
+			}
+
+			_DBG("reference count [%d]", referred);
+		}
+
+		_END();
+	}
+
+	int NFCTerminal::transmitSync(const ByteArray &command, ByteArray &response)
+	{
+		int rv = SCARD_ERROR_NOT_INITIALIZED;
+
+		_BEGIN();
+
+		if (isClosed() == false)
+		{
+			if (command.size() > 0)
 			{
-	#ifndef ASYNC
-				syncLock();
-				if ((rv = waitTimedCondition(3)) == 0 && error == NET_NFC_OK)
+				uint8_t *resp = NULL;
+				uint32_t resp_len;
+
+				rv = nfc_se_send_apdu_internal(seHandle,
+					(uint8_t *)command.getBuffer(),
+					command.size(),
+					&resp,
+					&resp_len);
+				if (rv == NFC_ERROR_NONE &&
+					resp != NULL)
 				{
-	#endif
-					SCARD_DEBUG("net_nfc_close_internal_secure_element returns [%d]", ret);
-	#ifndef ASYNC
+					response.assign(resp, resp_len);
+
+					g_free(resp);
 				}
 				else
 				{
-					SCARD_DEBUG_ERR("net_nfc_close_internal_secure_element failed, error [%d], rv [%d]", error, rv);
+					_ERR("net_nfc_send_apdu_sync failed, [%d]", rv);
 				}
-				syncUnlock();
-	#endif
 			}
 			else
 			{
-				SCARD_DEBUG_ERR("net_nfc_close_internal_secure_element failed [%d]", ret);
+				_ERR("invalid command");
 			}
 		}
-
-		SCARD_END();
-	}
-
-	bool NFCTerminal::isClosed()
-	{
-		return closed;
-	}
-
-	int NFCTerminal::transmitSync(ByteArray command, ByteArray &response)
-	{
-		int rv = 0;
-		data_h data;
-
-		SCARD_BEGIN();
-
-		SCOPE_LOCK(mutex)
+		else
 		{
-			if (command.getLength() > 0)
-			{
-				SCARD_DEBUG("command : %s", command.toString());
-
-#ifndef ASYNC
-				response.releaseBuffer();
-#endif
-				net_nfc_create_data(&data, command.getBuffer(), command.getLength());
-				net_nfc_send_apdu(seHandle, data, this);
-#ifndef ASYNC
-				syncLock();
-				rv = waitTimedCondition(3);
-
-				if (rv == 0 && error == NET_NFC_OK)
-				{
-					if (response.getLength() > 0)
-					{
-						response = response;
-					}
-
-					SCARD_DEBUG("transmit success, length [%d]", response.getLength());
-				}
-				else
-				{
-					SCARD_DEBUG_ERR("transmit failed, rv [%d], cbResult [%d]", rv, error);
-				}
-				syncUnlock();
-
-				rv = error;
-#endif
-			}
-			else
-			{
-				rv = -1;
-			}
+			_ERR("closed...");
 		}
 
-		SCARD_END();
+		_END();
 
 		return rv;
 	}
 
 	int NFCTerminal::getATRSync(ByteArray &atr)
 	{
-		int rv = 0;
+		int rv = -1;
 
-		SCARD_BEGIN();
+		_BEGIN();
 
-		SCOPE_LOCK(mutex)
+		if (isClosed() == false)
 		{
+			uint8_t *temp = NULL;
+			uint32_t temp_len;
+
+			rv = nfc_se_get_atr_internal(seHandle, &temp, &temp_len);
+			if (rv == NFC_ERROR_NONE &&
+				temp != NULL)
+			{
+				atr.assign(temp, temp_len);
+
+				g_free(temp);
+			}
+			else
+			{
+				_ERR("net_nfc_client_se_get_atr_sync failed");
+			}
+		}
+		else
+		{
+			_ERR("closed...");
 		}
 
-		SCARD_END();
+		_END();
 
 		return rv;
 	}
-
-	bool NFCTerminal::isSecureElementPresence()
-	{
-		return (seHandle != NULL);
-	}
-
-	void NFCTerminal::nfcResponseCallback(net_nfc_message_e message, net_nfc_error_e result, void *data , void *userContext, void *transData)
-	{
-		NFCTerminal *instance = (NFCTerminal *)userContext;
-
-		SCARD_BEGIN();
-
-		if (instance == NULL)
-		{
-			SCARD_DEBUG_ERR("instance is null");
-			return;
-		}
-
-		switch(message)
-		{
-		case NET_NFC_MESSAGE_SET_SE :
-			SCARD_DEBUG("NET_NFC_MESSAGE_SET_SE");
-			break;
-
-		case NET_NFC_MESSAGE_GET_SE :
-			SCARD_DEBUG("NET_NFC_MESSAGE_GET_SE");
-			break;
-
-		case NET_NFC_MESSAGE_OPEN_INTERNAL_SE :
-			SCARD_DEBUG("NET_NFC_MESSAGE_OPEN_INTERNAL_SE");
-
-			if (result == NET_NFC_OK)
-			{
-				if (data != NULL)
-				{
-					instance->seHandle = (net_nfc_target_handle_h)data;
-					instance->closed = false;
-				}
-				else
-				{
-					SCARD_DEBUG_ERR("NET_NFC_MESSAGE_OPEN_INTERNAL_SE failed");
-				}
-			}
-			else
-			{
-				SCARD_DEBUG_ERR("NET_NFC_MESSAGE_OPEN_INTERNAL_SE returns error [%d]", result);
-			}
-
-			instance->error = result;
-
-			instance->syncLock();
-			instance->signalCondition();
-			instance->syncUnlock();
-			break;
-
-		case NET_NFC_MESSAGE_CLOSE_INTERNAL_SE :
-			SCARD_DEBUG("NET_NFC_MESSAGE_CLOSE_INTERNAL_SE");
-
-			if (result == NET_NFC_OK)
-			{
-				instance->closed = true;
-			}
-			else
-			{
-				SCARD_DEBUG_ERR("NET_NFC_MESSAGE_CLOSE_INTERNAL_SE failed [%d]", result);
-			}
-
-			instance->error = result;
-
-			instance->syncLock();
-			instance->signalCondition();
-			instance->syncUnlock();
-			break;
-
-		case NET_NFC_MESSAGE_SEND_APDU_SE :
-			{
-				data_h resp = (data_h)data;
-
-				SCARD_DEBUG("NET_NFC_MESSAGE_SEND_APDU_SE");
-
-				if (result == NET_NFC_OK)
-				{
-					if (resp != NULL)
-					{
-						SCARD_DEBUG("apdu result length [%d]", net_nfc_get_data_length(resp));
-						instance->response.setBuffer(net_nfc_get_data_buffer(resp), net_nfc_get_data_length(resp));
-					}
-				}
-				else
-				{
-					SCARD_DEBUG_ERR("NET_NFC_MESSAGE_OPEN_INTERNAL_SE failed [%d]", result);
-				}
-
-				instance->error = result;
-
-				instance->syncLock();
-				instance->signalCondition();
-				instance->syncUnlock();
-			}
-			break;
-
-//		case NFC_ON_NOTI_CASE :
-//			{
-//				finalize();
-//
-//				/* send notification */
-//				if (instance->statusCallback != NULL)
-//				{
-//					instance->statusCallback(se_name, NOTIFY_SE_AVAILABLE, 0, NULL);
-//				}
-//			}
-//			break;
-//
-//		case NFC_OFF_NOTI_CASE :
-//			{
-//				initialize();
-//				if (open() == true)
-//				{
-//					/* send notification */
-//					if (instance->statusCallback != NULL)
-//					{
-//						instance->statusCallback(se_name, NOTIFY_SE_NOT_AVAILABLE, 0, NULL);
-//					}
-//				}
-//			}
-//			break;
-
-		default:
-			SCARD_DEBUG("unknown message : [%d], [%d], [%p], [%p], [%p]", message, result, data, userContext, instance);
-			break;
-		}
-
-		SCARD_END();
-	}
 } /* namespace smartcard_service_api */
-

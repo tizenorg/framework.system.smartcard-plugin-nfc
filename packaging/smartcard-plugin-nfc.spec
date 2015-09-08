@@ -1,38 +1,43 @@
-Name:       smartcard-plugin-nfc
-Summary:    Smartcard plugin nfc
-Version: 0.0.1
-Release:    4
-Group:      libs
-License:    Samsung Proprietary License
-Source0:    %{name}-%{version}.tar.gz
-BuildRequires: pkgconfig(glib-2.0)
-BuildRequires: pkgconfig(dlog)
-BuildRequires: pkgconfig(nfc)
-BuildRequires: pkgconfig(nfc-common-lib)
-BuildRequires: pkgconfig(smartcard-service)
-BuildRequires: pkgconfig(smartcard-service-common)
-BuildRequires: cmake
-BuildRequires: gettext-tools
+Name:             smartcard-plugin-nfc
+Summary:          Smartcard plugin nfc
+Version:          0.0.12
+Release:          0
+Group:            libs
+License:          Apache License, Version 2.0
+Source0:          %{name}-%{version}.tar.gz
+BuildRequires:    cmake
+BuildRequires:    pkgconfig(glib-2.0)
+BuildRequires:    pkgconfig(dlog)
+BuildRequires:    pkgconfig(smartcard-service-common)
+BuildRequires:    pkgconfig(capi-network-nfc)
 Requires(post):   /sbin/ldconfig
-Requires(post):   /usr/bin/vconftool
-requires(postun): /sbin/ldconfig
+Requires(postun): /sbin/ldconfig
+
+
 %description
 Smartcard Service plugin nfc
+
 
 %prep
 %setup -q
 
 
 %package    devel
-Summary:    smartcard service
+Summary:    smartcard service nfc
 Group:      Development/Libraries
 Requires:   %{name} = %{version}-%{release}
+
 
 %description devel
 smartcard service.
 
 
 %build
+%if 0%{?sec_build_binary_debug_enable}
+export CFLAGS="$CFLAGS -DTIZEN_DEBUG_ENABLE"
+export CXXFLAGS="$CXXFLAGS -DTIZEN_DEBUG_ENABLE"
+export FFLAGS="$FFLAGS -DTIZEN_DEBUG_ENABLE"
+%endif
 mkdir obj-arm-limux-qnueabi
 cd obj-arm-limux-qnueabi
 cmake .. -DCMAKE_INSTALL_PREFIX=%{_prefix}
@@ -42,6 +47,9 @@ cmake .. -DCMAKE_INSTALL_PREFIX=%{_prefix}
 %install
 cd obj-arm-limux-qnueabi
 %make_install
+mkdir -p %{buildroot}/usr/share/license
+cp -af %{_builddir}/%{name}-%{version}/packaging/%{name} %{buildroot}/usr/share/license/
+
 
 %post
 /sbin/ldconfig
@@ -50,14 +58,9 @@ cd obj-arm-limux-qnueabi
 %postun
 /sbin/ldconfig
 
-#%post
-# -n nfc-common-lib -p /sbin/ldconfig
-
-#%postun
-# -n nfc-common-lib -p /sbin/ldconfig
 
 %files
+%manifest %{name}.manifest
 %defattr(-,root,root,-)
-/usr/lib/se/lib*.so
-
-
+%{_libdir}/se/lib*.so
+%{_datadir}/license/%{name}
