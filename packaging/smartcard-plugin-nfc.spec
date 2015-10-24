@@ -3,7 +3,7 @@ Summary:          Smartcard plugin nfc
 Version:          0.0.12
 Release:          0
 Group:            libs
-License:          Apache License, Version 2.0
+License:          Apache-2.0
 Source0:          %{name}-%{version}.tar.gz
 BuildRequires:    cmake
 BuildRequires:    pkgconfig(glib-2.0)
